@@ -77,7 +77,7 @@ struct UIState {
     int windowHeight = 720;
 
     // FOV settings
-    int fovDegrees = 90;     // FOV in degrees (70, 90, or 110)
+    int fovDegrees = 70;     // FOV in degrees (70, 90, or 110)
 
     // Render options
     bool showFullRender = false;  // If true, show full swapchain instead of imageRect crop

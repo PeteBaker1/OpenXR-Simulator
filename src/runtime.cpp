@@ -250,7 +250,7 @@ static UINT g_persistentHeight = 540;
 static bool g_windowClassRegistered = false;
 static DWORD g_windowOwnerThread = 0;  // Thread that created the preview window
 static HWND g_orphanedWindow = nullptr;  // Window left behind from a previous session
-static bool g_inLiveResize = false;  // True while user is dragging window border
+
 
 struct Instance {
     XrInstance handle{(XrInstance)1};
@@ -714,12 +714,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
             return 0;
-        case WM_ENTERSIZEMOVE:
-            rt::g_inLiveResize = true;
-            return 0;
-        case WM_EXITSIZEMOVE:
-            rt::g_inLiveResize = false;
-            return 0;
+        // Removed WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE handling - was causing freeze during manual resize
+        // ensurePreviewSized already has an early-return to skip recreation if size hasn't changed
         default:
             break;
     }
@@ -3532,10 +3528,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 Logf("[SimXR] GL PREVIEW: targetSize=%dx%d, calling ensurePreviewSized", targetWidth, targetHeight);
             }
 
-            // During live resize, skip swapchain recreation
-            if (!rt::g_inLiveResize) {
-                ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
-            }
+            ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
 
             if (!s.previewSwapchain) {
                 Log("[SimXR] GL PREVIEW: ERROR - previewSwapchain is NULL after ensurePreviewSized!");
@@ -3745,12 +3738,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
             if (cw > 0 && ch > 0) { targetWidth = cw; targetHeight = ch; }
         }
-        // During live resize, just present to the existing swapchain — skip recreation
-        if (rt::g_inLiveResize && (s.previewSwapchain || s.previewSwapchain12)) {
-            // Still need to present, but don't recreate
-        } else {
-            ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
-        }
+        ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
         const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
         const bool showLeft = (viewMode != ui::ViewMode::RightEyeOnly);
         const bool showRight = (viewMode != ui::ViewMode::LeftEyeOnly);

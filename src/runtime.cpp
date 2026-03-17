@@ -137,7 +137,6 @@ static void EnsureLogFile() {
     fopen_s(&g_LogFile, path, "a");
 }
 static void Log(const char* msg) {
-    OutputDebugStringA(msg);
     EnsureLogFile();
     if (g_LogFile) { fputs(msg, g_LogFile); if (msg[0] && msg[strlen(msg)-1] != '\n') fputc('\n', g_LogFile); fflush(g_LogFile);} }
 static void Log(const std::string& msg) { Log(msg.c_str()); }
@@ -553,7 +552,25 @@ bool InitBlitResources(Session& s) {
     return true;
 }
 
+// Wait for all D3D12 GPU work to complete before releasing resources
+static void DrainD3D12PreviewGPU(rt::Session& s) {
+    if (!s.d3d12Queue || !s.previewFence || !s.previewFenceEvent) return;
+    HRESULT hr = s.d3d12Queue->Signal(s.previewFence.Get(), s.previewFenceValue);
+    if (SUCCEEDED(hr) && s.previewFence->GetCompletedValue() < s.previewFenceValue) {
+        s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
+        WaitForSingleObject(s.previewFenceEvent, 5000);
+    }
+    s.previewFenceValue++;
+    // Also flush D3D11 context if using D3D11On12
+    if (s.d3d11Context) {
+        s.d3d11Context->ClearState();
+        s.d3d11Context->Flush();
+    }
+}
+
 static void ResetD3D12PreviewResources(rt::Session& s) {
+    // Drain GPU before releasing any resources
+    DrainD3D12PreviewGPU(s);
     // Release D3D11On12 wrapped backbuffers before releasing the D3D12 resources
     s.backbufferRTVs11.clear();
     s.wrappedBackbuffers.clear();
@@ -575,11 +592,16 @@ static void ResetD3D12PreviewResources(rt::Session& s) {
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CLOSE:
-            if (rt::g_session.handle != XR_NULL_HANDLE) {
-                rt::PushState(rt::g_session.handle, XR_SESSION_STATE_EXITING);
-            }
             Log("[SimXR] WndProc: WM_CLOSE received");
-            DestroyWindow(hWnd);
+            if (rt::g_session.handle != XR_NULL_HANDLE &&
+                rt::g_session.state != XR_SESSION_STATE_STOPPING &&
+                rt::g_session.state != XR_SESSION_STATE_EXITING &&
+                rt::g_session.state != XR_SESSION_STATE_IDLE) {
+                rt::PushState(rt::g_session.handle, XR_SESSION_STATE_STOPPING);
+            }
+            // Don't DestroyWindow here - let the session teardown handle cleanup
+            // Just hide the window so it's not stuck on screen
+            ShowWindow(hWnd, SW_HIDE);
             return 0;
         case WM_DESTROY:
             // DON'T call PostQuitMessage - we're a DLL, not the main app!
@@ -986,18 +1008,48 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         // MUST destroy the window before DLL unloads!
         // The OpenXR loader may unload our DLL after this call.
         // If the window stays alive, its WndProc points to unloaded code = crash.
+        // 
+        // DestroyWindow must be called from the thread that created the window.
+        // If we're on a different thread, it will deadlock. Instead, we
+        // neutralize the WndProc (so no dangling pointer after DLL unload)
+        // and then try DestroyWindow with a message pump to drain any pending
+        // messages, or fall back to hiding + detaching if cross-thread.
+        HWND windowToDestroy = nullptr;
         {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
-            if (rt::g_persistentWindow) {
-                Log("[SimXR] xrDestroyInstance: Destroying preview window");
-                DestroyWindow(rt::g_persistentWindow);
-                rt::g_persistentWindow = nullptr;
-            }
+            windowToDestroy = rt::g_persistentWindow;
+            rt::g_persistentWindow = nullptr;
             rt::g_persistentSwapchain.Reset();
         }
-        // Also clear session window reference
         if (rt::g_session.hwnd) {
             rt::g_session.hwnd = nullptr;
+        }
+
+        if (windowToDestroy && IsWindow(windowToDestroy)) {
+            Log("[SimXR] xrDestroyInstance: Destroying preview window");
+            // Replace WndProc with DefWindowProc so even if DestroyWindow
+            // fails cross-thread, the window won't call into unloaded code.
+            SetWindowLongPtrW(windowToDestroy, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
+
+            // Try DestroyWindow — works if same thread as creator.
+            // If cross-thread, DestroyWindow returns FALSE; in that case
+            // force-close via WM_CLOSE and pump messages with a timeout.
+            if (!DestroyWindow(windowToDestroy)) {
+                Log("[SimXR] xrDestroyInstance: Cross-thread destroy, posting WM_CLOSE");
+                PostMessageW(windowToDestroy, WM_CLOSE, 0, 0);
+                // Pump messages briefly to allow the close to process
+                MSG msg;
+                DWORD deadline = GetTickCount() + 500;
+                while (IsWindow(windowToDestroy) && GetTickCount() < deadline) {
+                    if (PeekMessageW(&msg, windowToDestroy, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    } else {
+                        Sleep(1);
+                    }
+                }
+            }
+            Log("[SimXR] xrDestroyInstance: Window cleanup done");
         }
 
         // Unregister window class so it doesn't have dangling WndProc
@@ -1233,43 +1285,72 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         return XR_ERROR_HANDLE_INVALID;
     }
     
-    // Transfer window and swapchain to global persistent storage
-    // Unity likes to create/destroy sessions rapidly for compatibility checks
+    // 1. Drain D3D12 GPU and flush D3D11 before releasing anything
+    if (rt::g_session.usesD3D12) {
+        rt::DrainD3D12PreviewGPU(rt::g_session);
+        Log("[SimXR] xrDestroySession: GPU drained");
+    } else if (rt::g_session.d3d11Context) {
+        rt::g_session.d3d11Context->ClearState();
+        rt::g_session.d3d11Context->Flush();
+    }
+
+    // 2. Neutralize and abandon the window.
+    //    The persistent window concept caused cross-thread deadlocks and stale
+    //    messages. Instead: swap WndProc to DefWindowProcW (safe if DLL unloads),
+    //    clear all references, and post WM_CLOSE so it eventually self-destructs
+    //    when someone pumps messages on its thread.
     {
-        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
-        if (rt::g_session.hwnd && !rt::g_persistentWindow) {
-            rt::g_persistentWindow = rt::g_session.hwnd;
-            rt::g_persistentSwapchain = rt::g_session.previewSwapchain;
-            rt::g_persistentWidth = rt::g_session.previewWidth;
-            rt::g_persistentHeight = rt::g_session.previewHeight;
-            Log("[SimXR] xrDestroySession: Preserving window and swapchain for next session");
-        } else if (rt::g_session.hwnd == rt::g_persistentWindow) {
-            // Already using persistent window, just update the swapchain
-            rt::g_persistentSwapchain = rt::g_session.previewSwapchain;
-            rt::g_persistentWidth = rt::g_session.previewWidth;
-            rt::g_persistentHeight = rt::g_session.previewHeight;
-            Log("[SimXR] xrDestroySession: Updating persistent swapchain");
+        HWND windowToAbandon = rt::g_session.hwnd;
+        {
+            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+            rt::g_persistentWindow = nullptr;
+            rt::g_persistentSwapchain.Reset();
+        }
+        if (windowToAbandon && IsWindow(windowToAbandon)) {
+            // Make the window safe: DefWindowProcW handles WM_CLOSE by calling
+            // DestroyWindow, and won't call into our (possibly unloaded) code.
+            SetWindowLongPtrW(windowToAbandon, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
+            PostMessageW(windowToAbandon, WM_CLOSE, 0, 0);
+            Log("[SimXR] xrDestroySession: Window neutralized and close posted");
         }
     }
-    
-    // Reset session but don't destroy the window
+
+    // 3. Reset session state
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
-    // Reset D3D11On12 interop (must be released before D3D12 device)
+
+    // 4. Release blit resources (D3D11 shader objects)
+    rt::g_session.blitVS.Reset();
+    rt::g_session.blitPS.Reset();
+    rt::g_session.samplerState.Reset();
+    rt::g_session.noCullRS.Reset();
+    rt::g_session.anaglyphRedBS.Reset();
+    rt::g_session.anaglyphCyanBS.Reset();
+
+    // 5. Release D3D12 preview resources BEFORE the D3D12 queue/device
+    //    (ResetD3D12PreviewResources handles its own GPU drain if queue still alive)
+    rt::g_session.previewSwapchain.Reset();
+    rt::ResetD3D12PreviewResources(rt::g_session);
+
+    // 6. Release D3D11On12 interop (must be released before D3D12 device)
     rt::g_session.d3d11On12Interface.Reset();
     rt::g_session.d3d11On12Context.Reset();
     rt::g_session.d3d11On12Device.Reset();
+
+    // 7. Release D3D11
     rt::g_session.d3d11Device.Reset();
     rt::g_session.d3d11Context.Reset();
-    rt::g_session.usesD3D12 = false;
-    rt::g_session.d3d12Device.Reset();
+
+    // 8. Release D3D12 queue and device last
     rt::g_session.d3d12Queue.Reset();
-    rt::ResetD3D12PreviewResources(rt::g_session);
-    // Reset OpenGL state
+    rt::g_session.d3d12Device.Reset();
+    rt::g_session.usesD3D12 = false;
+
+    // 9. Reset OpenGL state
     rt::g_session.usesOpenGL = false;
     rt::g_session.glDC = nullptr;
     rt::g_session.glRC = nullptr;
-    rt::g_session.hwnd = nullptr;  // Clear from session but window still exists
+    rt::g_session.hwnd = nullptr;
     rt::g_session.previewWidth = 1920;
     rt::g_session.previewHeight = 540;
     rt::g_session.isFocused = false;
@@ -2033,8 +2114,20 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     }
     return XR_SUCCESS; 
 }
-static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { Log("[SimXR] xrEndSession"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) { rt::PushState(s, XR_SESSION_STATE_EXITING); return XR_SUCCESS; }
+static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
+    Log("[SimXR] xrEndSession");
+    // App calls xrEndSession in response to STOPPING.
+    // Transition: STOPPING -> IDLE -> EXITING per OpenXR spec.
+    rt::PushState(s, XR_SESSION_STATE_IDLE);
+    rt::PushState(s, XR_SESSION_STATE_EXITING);
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) {
+    Log("[SimXR] xrRequestExitSession");
+    // Per OpenXR spec: runtime signals STOPPING so app can call xrEndSession.
+    rt::PushState(s, XR_SESSION_STATE_STOPPING);
+    return XR_SUCCESS;
+}
 static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*, XrFrameState* s) {
     if (!s) return XR_ERROR_VALIDATION_FAILURE;
     // Message pump so the preview window stays responsive
@@ -2768,7 +2861,9 @@ static ComPtr<ID3D11Resource> wrapD3D12TextureAsD3D11(rt::Session& s, rt::Swapch
 // D3D11On12-based blit: wraps D3D12 textures and uses D3D11 shader pipeline
 static void blitD3D12ToPreviewD3D11On12(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
+                                const XrRect2Di& leftRect,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
+                                const XrRect2Di& rightRect,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
     UINT bbIndex = s.previewSwapchain12->GetCurrentBackBufferIndex();
     if (bbIndex >= s.wrappedBackbuffers.size() || !s.wrappedBackbuffers[bbIndex] || !s.backbufferRTVs11[bbIndex]) {
@@ -2841,6 +2936,7 @@ static void blitD3D12ToPreviewD3D11On12(rt::Session& s,
 
     // Helper to create SRV from wrapped D3D11 resource and blit a single eye
     auto blitOneEye = [&](ID3D11Resource* wrappedRes, rt::Swapchain& chain, uint32_t arraySlice,
+                          const XrRect2Di& rect,
                           const D3D11_VIEWPORT& vp, ID3D11BlendState* blend) {
         if (!wrappedRes) return;
 
@@ -2857,24 +2953,70 @@ static void blitD3D12ToPreviewD3D11On12(rt::Session& s,
             default: break;
         }
 
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = srvFormat;
-        if (chain.arraySize > 1) {
-            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srvDesc.Texture2DArray.MipLevels = 1;
-            srvDesc.Texture2DArray.FirstArraySlice = arraySlice;
-            srvDesc.Texture2DArray.ArraySize = 1;
-        } else {
+        // Check if we need to crop to imageRect (UE often packs both eyes in one wide texture)
+        bool needsCrop = !ui::g_uiState.showFullRender &&
+                         rect.extent.width > 0 && rect.extent.height > 0 &&
+                         (rect.extent.width < (int32_t)chain.width ||
+                          rect.extent.height < (int32_t)chain.height ||
+                          rect.offset.x != 0 || rect.offset.y != 0);
+
+        ComPtr<ID3D11Texture2D> viewTexture;
+        ComPtr<ID3D11ShaderResourceView> srv;
+
+        if (needsCrop) {
+            // Clamp rect to texture bounds
+            int32_t rx = (std::max)(rect.offset.x, 0);
+            int32_t ry = (std::max)(rect.offset.y, 0);
+            int32_t rw = (std::min)(rect.extent.width, (int32_t)chain.width - rx);
+            int32_t rh = (std::min)(rect.extent.height, (int32_t)chain.height - ry);
+            if (rw <= 0 || rh <= 0) return;
+
+            // Create temp texture for cropped region
+            D3D11_TEXTURE2D_DESC tempDesc = {};
+            tempDesc.Width = (UINT)rw;
+            tempDesc.Height = (UINT)rh;
+            tempDesc.MipLevels = 1;
+            tempDesc.ArraySize = 1;
+            tempDesc.Format = srvFormat;
+            tempDesc.SampleDesc.Count = 1;
+            tempDesc.Usage = D3D11_USAGE_DEFAULT;
+            tempDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            HRESULT hr = s.d3d11Device->CreateTexture2D(&tempDesc, nullptr, viewTexture.GetAddressOf());
+            if (FAILED(hr)) return;
+
+            // Copy the cropped region from the wrapped source
+            UINT srcSubresource = D3D11CalcSubresource(0, arraySlice, chain.mipCount);
+            D3D11_BOX box = { (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
+            s.d3d11Context->CopySubresourceRegion(viewTexture.Get(), 0, 0, 0, 0,
+                                                  wrappedRes, srcSubresource, &box);
+
+            // Create SRV on the cropped temp texture
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = srvFormat;
             srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             srvDesc.Texture2D.MipLevels = 1;
-        }
-
-        ComPtr<ID3D11ShaderResourceView> srv;
-        HRESULT hr = s.d3d11Device->CreateShaderResourceView(wrappedRes, &srvDesc, srv.GetAddressOf());
-        if (FAILED(hr)) {
-            // Try without explicit format
-            hr = s.d3d11Device->CreateShaderResourceView(wrappedRes, nullptr, srv.GetAddressOf());
+            hr = s.d3d11Device->CreateShaderResourceView(viewTexture.Get(), &srvDesc, srv.GetAddressOf());
             if (FAILED(hr)) return;
+        } else {
+            // No cropping needed - use the wrapped resource directly
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = srvFormat;
+            if (chain.arraySize > 1) {
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                srvDesc.Texture2DArray.MipLevels = 1;
+                srvDesc.Texture2DArray.FirstArraySlice = arraySlice;
+                srvDesc.Texture2DArray.ArraySize = 1;
+            } else {
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MipLevels = 1;
+            }
+
+            HRESULT hr = s.d3d11Device->CreateShaderResourceView(wrappedRes, &srvDesc, srv.GetAddressOf());
+            if (FAILED(hr)) {
+                hr = s.d3d11Device->CreateShaderResourceView(wrappedRes, nullptr, srv.GetAddressOf());
+                if (FAILED(hr)) return;
+            }
         }
 
         // Blit using D3D11 pipeline
@@ -2901,16 +3043,16 @@ static void blitD3D12ToPreviewD3D11On12(rt::Session& s,
 
     if (singleEye) {
         if (showLeft && wrappedL)
-            blitOneEye(wrappedL.Get(), chainL, leftSlice, fullVp, nullptr);
+            blitOneEye(wrappedL.Get(), chainL, leftSlice, leftRect, fullVp, nullptr);
         else if (showRight && wrappedR)
-            blitOneEye(wrappedR.Get(), *chainR, rightSlice, fullVp, nullptr);
+            blitOneEye(wrappedR.Get(), *chainR, rightSlice, rightRect, fullVp, nullptr);
     } else {
         if (showLeft && wrappedL)
-            blitOneEye(wrappedL.Get(), chainL, leftSlice, leftVp, leftBlend);
+            blitOneEye(wrappedL.Get(), chainL, leftSlice, leftRect, leftVp, leftBlend);
         if (showRight && chainR && wrappedR)
-            blitOneEye(wrappedR.Get(), *chainR, rightSlice, rightVp, rightBlend);
+            blitOneEye(wrappedR.Get(), *chainR, rightSlice, rightRect, rightVp, rightBlend);
         else if (showRight && wrappedL)
-            blitOneEye(wrappedL.Get(), chainL, leftSlice, rightVp, rightBlend);
+            blitOneEye(wrappedL.Get(), chainL, leftSlice, leftRect, rightVp, rightBlend);
     }
 
     // Release wrapped resources back to D3D12
@@ -2926,7 +3068,9 @@ static void blitD3D12ToPreviewD3D11On12(rt::Session& s,
 // D3D12 blit function - copies swapchain textures to preview backbuffer (legacy copy-based fallback)
 static void blitD3D12ToPreview(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
+                                const XrRect2Di& leftRect,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
+                                const XrRect2Di& rightRect,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
     if (!s.previewSwapchain12) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview swapchain");
@@ -2950,7 +3094,9 @@ static void blitD3D12ToPreview(rt::Session& s,
 
     // Use D3D11On12 path if available (proper format conversion, sRGB, anaglyph)
     if (s.d3d11On12Interface) {
-        blitD3D12ToPreviewD3D11On12(s, chainL, leftIdx, leftSlice, chainR, rightIdx, rightSlice, layout, viewMode);
+        blitD3D12ToPreviewD3D11On12(s, chainL, leftIdx, leftSlice, leftRect,
+                                    chainR, rightIdx, rightSlice, rightRect,
+                                    layout, viewMode);
         return;
     }
 
@@ -3686,11 +3832,16 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                     rightIdx = chR.lastAcquired;
                 }
                 blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex,
+                                   vL.subImage.imageRect,
                                    &chR, rightIdx, vR.subImage.imageArrayIndex,
+                                   vR.subImage.imageRect,
                                    layout, viewMode);
             } else {
+                XrRect2Di emptyRect = {};
                 blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex,
-                                   nullptr, 0, 0, layout, viewMode);
+                                   vL.subImage.imageRect,
+                                   nullptr, 0, 0, emptyRect,
+                                   layout, viewMode);
             }
 
             // Present D3D12 (may be deferred if overlays are pending)

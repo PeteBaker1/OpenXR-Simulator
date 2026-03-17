@@ -269,17 +269,26 @@ struct Session {
     HGLRC glRC{nullptr};
     bool usesOpenGL{false};
 
-    // DX12 preview resources
+    // D3D11On12 interop for D3D12 preview rendering
+    ComPtr<ID3D11Device> d3d11On12Device;
+    ComPtr<ID3D11DeviceContext> d3d11On12Context;
+    ComPtr<ID3D11On12Device> d3d11On12Interface;
+
+    // DX12 preview resources (used with D3D11On12)
     ComPtr<IDXGISwapChain3> previewSwapchain12;
-    ComPtr<ID3D12DescriptorHeap> previewRTVHeap;
     std::vector<ComPtr<ID3D12Resource>> previewBackbuffers;
-    UINT previewRTVDescriptorSize{0};
+    std::vector<ComPtr<ID3D11Resource>> wrappedBackbuffers;
+    std::vector<ComPtr<ID3D11RenderTargetView>> backbufferRTVs11;
     UINT previewBackbufferCount{0};
-    ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
-    ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
     HANDLE previewFenceEvent{nullptr};
     UINT64 previewFenceValue{0};
+
+    // Legacy D3D12-only preview resources (kept for cleanup)
+    ComPtr<ID3D12DescriptorHeap> previewRTVHeap;
+    UINT previewRTVDescriptorSize{0};
+    ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
+    ComPtr<ID3D12GraphicsCommandList> previewCmdList;
 
     // Blit resources
     ComPtr<ID3D11VertexShader> blitVS;
@@ -309,6 +318,7 @@ struct Swapchain {
     std::vector<ComPtr<ID3D11Texture2D>> images;      // D3D11 path
     std::vector<ComPtr<ID3D12Resource>> images12;     // D3D12 path
     std::vector<D3D12_RESOURCE_STATES> imageStates12;
+    std::vector<ComPtr<ID3D11Resource>> wrappedImages11;  // D3D12 textures wrapped as D3D11 (via D3D11On12)
     std::vector<GLuint> imagesGL;                     // OpenGL path
     GLenum glInternalFormat{GL_RGBA8};                // OpenGL internal format
     uint32_t nextIndex{0};
@@ -544,6 +554,9 @@ bool InitBlitResources(Session& s) {
 }
 
 static void ResetD3D12PreviewResources(rt::Session& s) {
+    // Release D3D11On12 wrapped backbuffers before releasing the D3D12 resources
+    s.backbufferRTVs11.clear();
+    s.wrappedBackbuffers.clear();
     s.previewSwapchain12.Reset();
     s.previewRTVHeap.Reset();
     s.previewBackbuffers.clear();
@@ -755,6 +768,13 @@ static XrResult XRAPI_PTR xrGetD3D12GraphicsRequirementsKHR_runtime(
         break;
     }
     req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+
+    // Save this LUID for later validation (same as D3D11 path)
+    rt::g_adapterLuid = req->adapterLuid;
+    rt::g_adapterLuidSet = true;
+
+    Logf("[SimXR] xrGetD3D12GraphicsRequirementsKHR: adapterLuid=%ld/%lu",
+         (long)req->adapterLuid.HighPart, (unsigned long)req->adapterLuid.LowPart);
     Log("[SimXR] xrGetD3D12GraphicsRequirementsKHR: SUCCESS");
     return XR_SUCCESS;
 }
@@ -1084,6 +1104,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
         // Reset session manually
         rt::g_session.handle = XR_NULL_HANDLE;
         rt::g_session.state = XR_SESSION_STATE_IDLE;
+        rt::g_session.d3d11On12Interface.Reset();
+        rt::g_session.d3d11On12Context.Reset();
+        rt::g_session.d3d11On12Device.Reset();
         rt::g_session.d3d11Device.Reset();
         rt::g_session.d3d11Context.Reset();
         rt::g_session.previewSwapchain.Reset();
@@ -1132,12 +1155,47 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
             const auto* b12 = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry);
             rt::g_session.usesD3D12 = true;
+            rt::g_session.usesOpenGL = false;
             rt::g_session.d3d12Device = b12->device;
             rt::g_session.d3d12Queue = b12->queue;
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
             rt::g_session.previewSwapchain.Reset();
+            rt::g_session.glDC = nullptr;
+            rt::g_session.glRC = nullptr;
+            rt::g_session.state = XR_SESSION_STATE_IDLE;
             rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+
+            // Log the D3D12 device details
+            LUID deviceLuid = b12->device->GetAdapterLuid();
+            Logf("[SimXR] xrCreateSession: App D3D12 device LUID=%ld/%lu",
+                 (long)deviceLuid.HighPart, (unsigned long)deviceLuid.LowPart);
+
+            // Create D3D11On12 device for preview rendering (shader-based blit, format conversion)
+            {
+                IUnknown* ppQueues[] = { b12->queue };
+                HRESULT hr11on12 = D3D11On12CreateDevice(
+                    b12->device,
+                    0, // flags
+                    nullptr, 0, // feature levels
+                    ppQueues, 1,
+                    0, // node mask
+                    rt::g_session.d3d11On12Device.GetAddressOf(),
+                    rt::g_session.d3d11On12Context.GetAddressOf(),
+                    nullptr);
+                if (SUCCEEDED(hr11on12)) {
+                    rt::g_session.d3d11On12Device->QueryInterface(
+                        IID_PPV_ARGS(rt::g_session.d3d11On12Interface.GetAddressOf()));
+                    // Also expose as d3d11Device/Context for blit resources
+                    rt::g_session.d3d11Device = rt::g_session.d3d11On12Device;
+                    rt::g_session.d3d11On12Device->GetImmediateContext(rt::g_session.d3d11Context.GetAddressOf());
+                    Log("[SimXR] xrCreateSession: D3D11On12 device created for preview rendering");
+                } else {
+                    Logf("[SimXR] xrCreateSession: WARNING - D3D11On12CreateDevice failed 0x%08X, "
+                         "D3D12 preview will use copy-based fallback", (unsigned)hr11on12);
+                }
+            }
+
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D12, handle=%llu)", (unsigned long long)rt::g_session.handle);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
@@ -1197,6 +1255,10 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     // Reset session but don't destroy the window
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
+    // Reset D3D11On12 interop (must be released before D3D12 device)
+    rt::g_session.d3d11On12Interface.Reset();
+    rt::g_session.d3d11On12Context.Reset();
+    rt::g_session.d3d11On12Device.Reset();
     rt::g_session.d3d11Device.Reset();
     rt::g_session.d3d11Context.Reset();
     rt::g_session.usesD3D12 = false;
@@ -1325,17 +1387,30 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
             rd.SampleDesc.Quality = 0;
             rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
             rd.Flags = D3D12_RESOURCE_FLAG_NONE;
-            if (!(chain.format == DXGI_FORMAT_D32_FLOAT || chain.format == DXGI_FORMAT_D24_UNORM_S8_UINT || chain.format == DXGI_FORMAT_D16_UNORM)) {
+            bool isDepthFmt = (chain.format == DXGI_FORMAT_D32_FLOAT ||
+                               chain.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+                               chain.format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                               chain.format == DXGI_FORMAT_D16_UNORM);
+            if (isDepthFmt) {
+                rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                // Depth textures that are also sampled need to NOT deny shader resource
+                if (!(ci->usageFlags & XR_SWAPCHAIN_USAGE_SAMPLED_BIT)) {
+                    rd.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+                }
+            } else {
                 if (ci->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)
                     rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
                 if (ci->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT)
                     rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             }
             D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_STATES init =
-                (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-                    ? D3D12_RESOURCE_STATE_RENDER_TARGET
-                    : D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES init;
+            if (isDepthFmt)
+                init = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            else if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+                init = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            else
+                init = D3D12_RESOURCE_STATE_COMMON;
             ComPtr<ID3D12Resource> res;
             HRESULT hr = rt::g_session.d3d12Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, init, nullptr, IID_PPV_ARGS(res.GetAddressOf()));
             if (FAILED(hr)) {
@@ -2338,7 +2413,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         }
         return;
     } else {
-        // DX12 preview swapchain
+        // DX12 preview swapchain (with D3D11On12 rendering)
         ComPtr<IDXGIFactory4> factory;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())))) {
             Log("[SimXR] DX12 preview: CreateDXGIFactory1 failed");
@@ -2362,26 +2437,79 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         s.previewBackbufferCount = desc.BufferCount;
         s.previewBackbuffers.clear();
         s.previewBackbuffers.resize(desc.BufferCount);
+        s.wrappedBackbuffers.clear();
+        s.wrappedBackbuffers.resize(desc.BufferCount);
+        s.backbufferRTVs11.clear();
+        s.backbufferRTVs11.resize(desc.BufferCount);
 
-        // Create RTV heap
-        D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{}; rtvDesc.NumDescriptors = desc.BufferCount; rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rtvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-        if (FAILED(s.d3d12Device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(s.previewRTVHeap.GetAddressOf())))) {
-            Log("[SimXR] DX12 preview: CreateDescriptorHeap RTV failed"); return;
-        }
-        s.previewRTVDescriptorSize = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRTVHeap->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < desc.BufferCount; ++i) {
             if (FAILED(s.previewSwapchain12->GetBuffer(i, IID_PPV_ARGS(s.previewBackbuffers[i].GetAddressOf())))) {
                 Logf("[SimXR] DX12 preview: GetBuffer %u failed", i); return;
             }
-            s.d3d12Device->CreateRenderTargetView(s.previewBackbuffers[i].Get(), nullptr, rtvHandle);
-            rtvHandle.ptr += s.previewRTVDescriptorSize;
         }
-        // Command allocator/list
-        s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
-        s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
-        s.previewCmdList->Close();
-        // Fence
+
+        // If D3D11On12 is available, wrap backbuffers as D3D11 textures for shader-based blit
+        if (s.d3d11On12Interface) {
+            for (UINT i = 0; i < desc.BufferCount; ++i) {
+                D3D11_RESOURCE_FLAGS d3d11Flags = { D3D11_BIND_RENDER_TARGET };
+                hr = s.d3d11On12Interface->CreateWrappedResource(
+                    s.previewBackbuffers[i].Get(),
+                    &d3d11Flags,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    IID_PPV_ARGS(s.wrappedBackbuffers[i].GetAddressOf()));
+                if (FAILED(hr)) {
+                    Logf("[SimXR] DX12 preview: CreateWrappedResource(backbuffer %u) failed 0x%08X", i, (unsigned)hr);
+                    s.d3d11On12Interface.Reset(); // Fall back to copy-based
+                    break;
+                }
+                // Create sRGB RTV for proper gamma encoding
+                DXGI_FORMAT rtvFmt = format;
+                if (format == DXGI_FORMAT_R8G8B8A8_UNORM) rtvFmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                else if (format == DXGI_FORMAT_B8G8R8A8_UNORM) rtvFmt = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+                D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+                rtvDesc.Format = rtvFmt;
+                rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                hr = s.d3d11Device->CreateRenderTargetView(
+                    s.wrappedBackbuffers[i].Get(), &rtvDesc,
+                    s.backbufferRTVs11[i].GetAddressOf());
+                if (FAILED(hr)) {
+                    // Fallback without sRGB
+                    hr = s.d3d11Device->CreateRenderTargetView(
+                        s.wrappedBackbuffers[i].Get(), nullptr,
+                        s.backbufferRTVs11[i].GetAddressOf());
+                }
+                if (FAILED(hr)) {
+                    Logf("[SimXR] DX12 preview: CreateRenderTargetView(wrapped %u) failed 0x%08X", i, (unsigned)hr);
+                    s.d3d11On12Interface.Reset();
+                    break;
+                }
+            }
+            if (s.d3d11On12Interface) {
+                Log("[SimXR] DX12 preview: D3D11On12 wrapped backbuffers created");
+            }
+        }
+
+        // Fallback: create D3D12 command allocator/list for copy-based path
+        if (!s.d3d11On12Interface) {
+            // Create RTV heap
+            D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{}; rtvHeapDesc.NumDescriptors = desc.BufferCount; rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            if (FAILED(s.d3d12Device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(s.previewRTVHeap.GetAddressOf())))) {
+                Log("[SimXR] DX12 preview: CreateDescriptorHeap RTV failed"); return;
+            }
+            s.previewRTVDescriptorSize = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRTVHeap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 0; i < desc.BufferCount; ++i) {
+                s.d3d12Device->CreateRenderTargetView(s.previewBackbuffers[i].Get(), nullptr, rtvHandle);
+                rtvHandle.ptr += s.previewRTVDescriptorSize;
+            }
+            s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
+            s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
+            s.previewCmdList->Close();
+            Log("[SimXR] DX12 preview: Using copy-based fallback path");
+        }
+
+        // Fence (needed for both paths)
         s.d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s.previewFence.GetAddressOf()));
         s.previewFenceValue = 1;
         s.previewFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -2612,18 +2740,202 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     }
 }
 
-// D3D12 blit function - copies swapchain textures to preview backbuffer
+// Helper: ensure D3D12 swapchain texture has a D3D11On12 wrapped resource + SRV for a given image index
+static ComPtr<ID3D11Resource> wrapD3D12TextureAsD3D11(rt::Session& s, rt::Swapchain& chain, uint32_t idx) {
+    if (!s.d3d11On12Interface || idx >= chain.images12.size() || !chain.images12[idx])
+        return nullptr;
+
+    // Lazily create wrapped resources
+    if (chain.wrappedImages11.empty()) {
+        chain.wrappedImages11.resize(chain.images12.size());
+    }
+    if (!chain.wrappedImages11[idx]) {
+        D3D11_RESOURCE_FLAGS flags = { D3D11_BIND_SHADER_RESOURCE };
+        HRESULT hr = s.d3d11On12Interface->CreateWrappedResource(
+            chain.images12[idx].Get(),
+            &flags,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, // inState - source for sampling
+            D3D12_RESOURCE_STATE_RENDER_TARGET, // outState - back to RT for app
+            IID_PPV_ARGS(chain.wrappedImages11[idx].GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] wrapD3D12TextureAsD3D11: CreateWrappedResource failed 0x%08X", (unsigned)hr);
+            return nullptr;
+        }
+    }
+    return chain.wrappedImages11[idx];
+}
+
+// D3D11On12-based blit: wraps D3D12 textures and uses D3D11 shader pipeline
+static void blitD3D12ToPreviewD3D11On12(rt::Session& s,
+                                rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
+                                rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
+                                ui::DisplayLayout layout, ui::ViewMode viewMode) {
+    UINT bbIndex = s.previewSwapchain12->GetCurrentBackBufferIndex();
+    if (bbIndex >= s.wrappedBackbuffers.size() || !s.wrappedBackbuffers[bbIndex] || !s.backbufferRTVs11[bbIndex]) {
+        Log("[SimXR] blitD3D12ToPreviewD3D11On12: No wrapped backbuffer");
+        return;
+    }
+
+    // Initialize blit resources if needed
+    if (!rt::InitBlitResources(s)) {
+        Log("[SimXR] blitD3D12ToPreviewD3D11On12: Failed to init blit resources");
+        return;
+    }
+
+    // Collect resources to acquire
+    std::vector<ID3D11Resource*> acquireList;
+
+    // Acquire backbuffer
+    acquireList.push_back(s.wrappedBackbuffers[bbIndex].Get());
+
+    // Wrap source textures
+    auto wrappedL = wrapD3D12TextureAsD3D11(s, chainL, leftIdx);
+    if (wrappedL) acquireList.push_back(wrappedL.Get());
+
+    ComPtr<ID3D11Resource> wrappedR;
+    if (chainR) {
+        wrappedR = wrapD3D12TextureAsD3D11(s, *chainR, rightIdx);
+        if (wrappedR) acquireList.push_back(wrappedR.Get());
+    }
+
+    // Acquire all wrapped resources for D3D11 use
+    s.d3d11On12Interface->AcquireWrappedResources(acquireList.data(), (UINT)acquireList.size());
+
+    // Setup viewports
+    const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
+    const bool showLeft = (viewMode != ui::ViewMode::RightEyeOnly);
+    const bool showRight = (viewMode != ui::ViewMode::LeftEyeOnly);
+
+    D3D11_VIEWPORT fullVp = {};
+    fullVp.Width = (float)s.previewWidth;
+    fullVp.Height = (float)s.previewHeight;
+    fullVp.MinDepth = 0.0f;
+    fullVp.MaxDepth = 1.0f;
+
+    D3D11_VIEWPORT leftVp = fullVp, rightVp = fullVp;
+    if (!singleEye) {
+        if (layout == ui::DisplayLayout::SideBySide || layout == ui::DisplayLayout::Anaglyph) {
+            leftVp.Width = (float)s.previewWidth / 2.0f;
+            rightVp.Width = (float)s.previewWidth / 2.0f;
+            rightVp.TopLeftX = (float)s.previewWidth / 2.0f;
+        } else if (layout == ui::DisplayLayout::OverUnder) {
+            leftVp.Height = (float)s.previewHeight / 2.0f;
+            rightVp.Height = (float)s.previewHeight / 2.0f;
+            rightVp.TopLeftY = (float)s.previewHeight / 2.0f;
+        }
+    }
+
+    ID3D11BlendState* leftBlend = nullptr;
+    ID3D11BlendState* rightBlend = nullptr;
+    if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
+        leftBlend = s.anaglyphRedBS.Get();
+        rightBlend = s.anaglyphCyanBS.Get();
+    }
+
+    // Clear the backbuffer
+    ID3D11RenderTargetView* rtv = s.backbufferRTVs11[bbIndex].Get();
+    const float clearColorDefault[4] = {0.1f, 0.1f, 0.2f, 1.0f};
+    const float clearColorAnaglyph[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const float* clearColor = (layout == ui::DisplayLayout::Anaglyph) ? clearColorAnaglyph : clearColorDefault;
+    s.d3d11Context->ClearRenderTargetView(rtv, clearColor);
+
+    // Helper to create SRV from wrapped D3D11 resource and blit a single eye
+    auto blitOneEye = [&](ID3D11Resource* wrappedRes, rt::Swapchain& chain, uint32_t arraySlice,
+                          const D3D11_VIEWPORT& vp, ID3D11BlendState* blend) {
+        if (!wrappedRes) return;
+
+        // Determine typed format for SRV
+        DXGI_FORMAT srvFormat = chain.format;
+        switch (chain.format) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            case DXGI_FORMAT_R8G8B8A8_UNORM: srvFormat = chain.format; break;
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            case DXGI_FORMAT_B8G8R8A8_UNORM: srvFormat = chain.format; break;
+            case DXGI_FORMAT_R16G16B16A16_FLOAT: srvFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+            case DXGI_FORMAT_R32G32B32A32_FLOAT: srvFormat = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+            case DXGI_FORMAT_R10G10B10A2_UNORM: srvFormat = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+            default: break;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = srvFormat;
+        if (chain.arraySize > 1) {
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDesc.Texture2DArray.MipLevels = 1;
+            srvDesc.Texture2DArray.FirstArraySlice = arraySlice;
+            srvDesc.Texture2DArray.ArraySize = 1;
+        } else {
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+        }
+
+        ComPtr<ID3D11ShaderResourceView> srv;
+        HRESULT hr = s.d3d11Device->CreateShaderResourceView(wrappedRes, &srvDesc, srv.GetAddressOf());
+        if (FAILED(hr)) {
+            // Try without explicit format
+            hr = s.d3d11Device->CreateShaderResourceView(wrappedRes, nullptr, srv.GetAddressOf());
+            if (FAILED(hr)) return;
+        }
+
+        // Blit using D3D11 pipeline
+        ID3D11RenderTargetView* rtvs[1] = { rtv };
+        s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
+        s.d3d11Context->RSSetViewports(1, &vp);
+        s.d3d11Context->VSSetShader(s.blitVS.Get(), nullptr, 0);
+        s.d3d11Context->PSSetShader(s.blitPS.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+        s.d3d11Context->PSSetShaderResources(0, 1, srvs);
+        ID3D11SamplerState* samplers[] = { s.samplerState.Get() };
+        s.d3d11Context->PSSetSamplers(0, 1, samplers);
+        s.d3d11Context->IASetInputLayout(nullptr);
+        s.d3d11Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        s.d3d11Context->OMSetBlendState(blend, nullptr, 0xFFFFFFFF);
+        s.d3d11Context->OMSetDepthStencilState(nullptr, 0);
+        s.d3d11Context->RSSetState(s.noCullRS.Get());
+        s.d3d11Context->Draw(4, 0);
+
+        // Unbind SRV
+        ID3D11ShaderResourceView* nullSRV[] = { nullptr };
+        s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
+    };
+
+    if (singleEye) {
+        if (showLeft && wrappedL)
+            blitOneEye(wrappedL.Get(), chainL, leftSlice, fullVp, nullptr);
+        else if (showRight && wrappedR)
+            blitOneEye(wrappedR.Get(), *chainR, rightSlice, fullVp, nullptr);
+    } else {
+        if (showLeft && wrappedL)
+            blitOneEye(wrappedL.Get(), chainL, leftSlice, leftVp, leftBlend);
+        if (showRight && chainR && wrappedR)
+            blitOneEye(wrappedR.Get(), *chainR, rightSlice, rightVp, rightBlend);
+        else if (showRight && wrappedL)
+            blitOneEye(wrappedL.Get(), chainL, leftSlice, rightVp, rightBlend);
+    }
+
+    // Release wrapped resources back to D3D12
+    s.d3d11On12Interface->ReleaseWrappedResources(acquireList.data(), (UINT)acquireList.size());
+    s.d3d11Context->Flush();
+
+    static int blitCount = 0;
+    if (++blitCount % 60 == 1) {
+        Logf("[SimXR] blitD3D12ToPreview(D3D11On12): L[%u] R[%u] to backbuffer %u", leftIdx, rightIdx, bbIndex);
+    }
+}
+
+// D3D12 blit function - copies swapchain textures to preview backbuffer (legacy copy-based fallback)
 static void blitD3D12ToPreview(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
-    if (!s.previewSwapchain12 || !s.previewCmdList || !s.previewCmdAlloc) {
-        Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
+    if (!s.previewSwapchain12) {
+        Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview swapchain");
         return;
     }
 
     // Skip depth-only swapchains
     bool isDepthFormat = (chainL.format == DXGI_FORMAT_D32_FLOAT ||
+                          chainL.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                           chainL.format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
                           chainL.format == DXGI_FORMAT_D16_UNORM);
     if (isDepthFormat) {
@@ -2631,9 +2943,21 @@ static void blitD3D12ToPreview(rt::Session& s,
     }
 
     // Wait for previous frame to finish
-    if (s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
+    if (s.previewFence && s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
         s.previewFence->SetEventOnCompletion(s.previewFenceValue - 1, s.previewFenceEvent);
         WaitForSingleObject(s.previewFenceEvent, 1000);
+    }
+
+    // Use D3D11On12 path if available (proper format conversion, sRGB, anaglyph)
+    if (s.d3d11On12Interface) {
+        blitD3D12ToPreviewD3D11On12(s, chainL, leftIdx, leftSlice, chainR, rightIdx, rightSlice, layout, viewMode);
+        return;
+    }
+
+    // Fallback: copy-based path (requires matching bpp between source and dest)
+    if (!s.previewCmdList || !s.previewCmdAlloc) {
+        Log("[SimXR] blitD3D12ToPreview: Missing D3D12 command resources for fallback");
+        return;
     }
 
     // Get current backbuffer index
@@ -2730,7 +3054,7 @@ static void blitD3D12ToPreview(rt::Session& s,
     ui::DisplayLayout effectiveLayout = layout;
     if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
         if (!loggedAnaglyph) {
-            Log("[SimXR] blitD3D12ToPreview: Anaglyph not supported on D3D12 path; showing left eye only");
+            Log("[SimXR] blitD3D12ToPreview: Anaglyph not supported on copy fallback path; showing left eye only");
             loggedAnaglyph = true;
         }
         forceSingleEye = true;
@@ -2780,7 +3104,7 @@ static void blitD3D12ToPreview(rt::Session& s,
 
     static int blitCount = 0;
     if (++blitCount % 60 == 1) {
-        Logf("[SimXR] blitD3D12ToPreview: Copied L[%u] R[%u] to backbuffer %u", leftIdx, rightIdx, bbIndex);
+        Logf("[SimXR] blitD3D12ToPreview(copy fallback): L[%u] R[%u] to backbuffer %u", leftIdx, rightIdx, bbIndex);
     }
 }
 
@@ -3377,20 +3701,45 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             } else {
                 g_presentPending = true;
             }
+
+            // Update window title with stats
+            static int d3d12TitleFrameCount = 0;
+            static auto d3d12LastTitleUpdate = std::chrono::high_resolution_clock::now();
+            static int d3d12LastFPS = 0;
+            d3d12TitleFrameCount++;
+            auto now = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - d3d12LastTitleUpdate).count();
+            if (elapsed >= 500) {
+                d3d12LastFPS = (int)(d3d12TitleFrameCount * 1000 / elapsed);
+                d3d12TitleFrameCount = 0;
+                d3d12LastTitleUpdate = now;
+                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0);
+            }
+
+            // MCP Integration - screenshots via D3D11On12 if available
+            mcp::CheckScreenshotRequest();
+            if (mcp::g_screenshotRequested && s.d3d11On12Interface && s.previewSwapchain) {
+                mcp::CaptureScreenshot(s.d3d11Device.Get(), s.d3d11Context.Get(), s.previewSwapchain.Get());
+            }
         }
     }
 }
 
 // Render a quad layer as 2D overlay (supports both D3D11 and OpenGL)
 static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) {
-    if (!quad || !s.previewSwapchain) return;
+    if (!quad) return;
 
+    // D3D12 sessions need either D3D11On12 or a preview swapchain
     if (s.usesD3D12) {
-        static bool warnedD3D12 = false;
-        if (!warnedD3D12) {
-            Log("[SimXR] WARNING: Quad layer rendering not implemented for D3D12 sessions");
-            warnedD3D12 = true;
+        if (!s.d3d11On12Interface || !s.previewSwapchain12) {
+            static bool warnedD3D12 = false;
+            if (!warnedD3D12) {
+                Log("[SimXR] WARNING: Quad layer rendering requires D3D11On12 for D3D12 sessions");
+                warnedD3D12 = true;
+            }
+            return;
         }
+    } else if (!s.previewSwapchain) {
         return;
     }
 
@@ -3545,6 +3894,60 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
             Logf("[SimXR] Rendering quad layer (OpenGL): size=%.2fx%.2f, texSize=%ux%u, glTex=%u",
                  quad->size.width, quad->size.height, texWidth, texHeight, glTex);
         }
+    } else if (chain.backend == rt::Swapchain::Backend::D3D12 && !chain.images12.empty()) {
+        // D3D12 path - use D3D11On12 wrapped resources
+        if (texIdx >= chain.images12.size() || !chain.images12[texIdx]) return;
+        if (!s.d3d11On12Interface) return;
+
+        // Skip depth formats
+        bool isDepth = (chain.format == DXGI_FORMAT_D32_FLOAT || chain.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+                        chain.format == DXGI_FORMAT_D24_UNORM_S8_UINT || chain.format == DXGI_FORMAT_D16_UNORM);
+        if (isDepth) return;
+
+        // Wrap the D3D12 texture as D3D11
+        auto wrapped = wrapD3D12TextureAsD3D11(s, chain, texIdx);
+        if (!wrapped) return;
+
+        // Acquire wrapped resource for D3D11
+        ID3D11Resource* acq[] = { wrapped.Get() };
+        s.d3d11On12Interface->AcquireWrappedResources(acq, 1);
+
+        // Create a temp D3D11 texture copy for the quad
+        D3D11_TEXTURE2D_DESC tempDesc = {};
+        tempDesc.Width = texWidth;
+        tempDesc.Height = texHeight;
+        tempDesc.MipLevels = 1;
+        tempDesc.ArraySize = 1;
+        tempDesc.Format = chain.format;
+        tempDesc.SampleDesc.Count = 1;
+        tempDesc.Usage = D3D11_USAGE_DEFAULT;
+        tempDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        if (FAILED(s.d3d11Device->CreateTexture2D(&tempDesc, nullptr, quadTex.GetAddressOf()))) {
+            s.d3d11On12Interface->ReleaseWrappedResources(acq, 1);
+            return;
+        }
+
+        // Copy from wrapped resource to temp texture
+        uint32_t arraySlice = quad->subImage.imageArrayIndex;
+        uint32_t srcSub = D3D11CalcSubresource(0, arraySlice, chain.mipCount);
+        const auto& rect = quad->subImage.imageRect;
+        if (rect.extent.width > 0 && rect.extent.height > 0) {
+            D3D11_BOX box = { (UINT)rect.offset.x, (UINT)rect.offset.y, 0,
+                              (UINT)(rect.offset.x + rect.extent.width),
+                              (UINT)(rect.offset.y + rect.extent.height), 1 };
+            s.d3d11Context->CopySubresourceRegion(quadTex.Get(), 0, 0, 0, 0, wrapped.Get(), srcSub, &box);
+        } else {
+            s.d3d11Context->CopySubresourceRegion(quadTex.Get(), 0, 0, 0, 0, wrapped.Get(), srcSub, nullptr);
+        }
+
+        s.d3d11On12Interface->ReleaseWrappedResources(acq, 1);
+        s.d3d11Context->Flush();
+
+        if (shouldLog) {
+            Logf("[SimXR] Rendering quad layer (D3D12): size=%.2fx%.2f, texSize=%ux%u, fmt=%d",
+                 quad->size.width, quad->size.height, texWidth, texHeight, (int)chain.format);
+        }
     } else if (!chain.images.empty()) {
         // D3D11 path
         if (texIdx >= chain.images.size() || !chain.images[texIdx]) return;
@@ -3605,13 +4008,27 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         return;
     }
 
-    // Get backbuffer
+    // Get backbuffer and create RTV
     ComPtr<ID3D11Texture2D> bb;
-    if (FAILED(s.previewSwapchain->GetBuffer(0, IID_PPV_ARGS(bb.GetAddressOf())))) return;
-
-    // Create RTV
     ComPtr<ID3D11RenderTargetView> rtv;
-    if (FAILED(s.d3d11Device->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) return;
+
+    if (s.usesD3D12 && s.d3d11On12Interface && s.previewSwapchain12) {
+        // D3D12 path: use wrapped backbuffer
+        UINT bbIndex = s.previewSwapchain12->GetCurrentBackBufferIndex();
+        if (bbIndex < s.wrappedBackbuffers.size() && s.wrappedBackbuffers[bbIndex] && s.backbufferRTVs11[bbIndex]) {
+            // Acquire the backbuffer for D3D11 use
+            ID3D11Resource* acq[] = { s.wrappedBackbuffers[bbIndex].Get() };
+            s.d3d11On12Interface->AcquireWrappedResources(acq, 1);
+            rtv = s.backbufferRTVs11[bbIndex];
+        } else {
+            return;
+        }
+    } else if (s.previewSwapchain) {
+        if (FAILED(s.previewSwapchain->GetBuffer(0, IID_PPV_ARGS(bb.GetAddressOf())))) return;
+        if (FAILED(s.d3d11Device->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) return;
+    } else {
+        return;
+    }
 
     // Create SRV
     ComPtr<ID3D11ShaderResourceView> srv;
@@ -3663,6 +4080,16 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     // Cleanup
     ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
     s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
+
+    // Release wrapped backbuffer back to D3D12 if using D3D11On12
+    if (s.usesD3D12 && s.d3d11On12Interface && s.previewSwapchain12) {
+        UINT bbIndex = s.previewSwapchain12->GetCurrentBackBufferIndex();
+        if (bbIndex < s.wrappedBackbuffers.size() && s.wrappedBackbuffers[bbIndex]) {
+            ID3D11Resource* rel[] = { s.wrappedBackbuffers[bbIndex].Get() };
+            s.d3d11On12Interface->ReleaseWrappedResources(rel, 1);
+            s.d3d11Context->Flush();
+        }
+    }
 }
 
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
@@ -4193,6 +4620,9 @@ static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(XrSession, const
 static XrResult XRAPI_PTR xrDestroySwapchain_runtime(XrSwapchain sc) {
     auto it = rt::g_swapchains.find(sc);
     if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+
+    // Release D3D11On12 wrapped images before releasing D3D12 resources
+    it->second.wrappedImages11.clear();
 
     // For OpenGL swapchains, delete the textures
     if (it->second.backend == rt::Swapchain::Backend::OpenGL && !it->second.imagesGL.empty()) {

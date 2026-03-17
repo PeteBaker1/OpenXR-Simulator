@@ -265,29 +265,51 @@ inline void ShowAboutDialog(HWND parent) {
 // Calculate the preview window size based on source size and zoom
 // NOTE: srcWidth and srcHeight are the dimensions of a SINGLE EYE swapchain
 inline void CalculateWindowSize(int srcWidth, int srcHeight, int& outWidth, int& outHeight) {
-    float zoom = g_uiState.fitToWindow ? 0.5f : g_uiState.zoomLevel;
-
+    // First, compute the logical content size at 100% zoom
+    int contentWidth = srcWidth, contentHeight = srcHeight;
     switch (g_uiState.viewMode) {
         case ViewMode::BothEyes:
             if (g_uiState.displayLayout == DisplayLayout::SideBySide) {
-                // Two eyes side by side: double the width
-                outWidth = (int)(srcWidth * 2 * zoom);
-                outHeight = (int)(srcHeight * zoom);
+                contentWidth = srcWidth * 2;
             } else if (g_uiState.displayLayout == DisplayLayout::OverUnder) {
-                // Two eyes stacked: double the height
-                outWidth = (int)(srcWidth * zoom);
-                outHeight = (int)(srcHeight * 2 * zoom);
-            } else { // Anaglyph - both eyes overlap in same frame
-                outWidth = (int)(srcWidth * zoom);
-                outHeight = (int)(srcHeight * zoom);
+                contentHeight = srcHeight * 2;
             }
             break;
-        case ViewMode::LeftEyeOnly:
-        case ViewMode::RightEyeOnly:
-            // Single eye: just use the single eye dimensions
-            outWidth = (int)(srcWidth * zoom);
-            outHeight = (int)(srcHeight * zoom);
+        default:
             break;
+    }
+
+    if (g_uiState.fitToWindow) {
+        // Fit to window: compute a sensible initial window size.
+        // The content may have an extreme aspect ratio (e.g., very wide VR eye textures
+        // side by side), so we cap the aspect ratio for the window and let the 
+        // shader stretch to fill. Target ~60% of screen height with a reasonable aspect.
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        if (screenW <= 0) screenW = 1920;
+        if (screenH <= 0) screenH = 1080;
+
+        float contentAspect = (float)contentWidth / (float)contentHeight;
+        // Clamp aspect ratio to a reasonable range (16:9 = 1.78 to 32:9 = 3.56)
+        const float minAspect = 1.0f;
+        const float maxAspect = 3.6f;
+        float displayAspect = contentAspect;
+        if (displayAspect > maxAspect) displayAspect = maxAspect;
+        if (displayAspect < minAspect) displayAspect = minAspect;
+
+        // Target 60% screen height, capped at 80% screen width
+        int targetH = (int)(screenH * 0.6f);
+        int targetW = (int)(targetH * displayAspect);
+        if (targetW > (int)(screenW * 0.8f)) {
+            targetW = (int)(screenW * 0.8f);
+            targetH = (int)(targetW / displayAspect);
+        }
+        outWidth = targetH > 0 ? targetW : 1280;
+        outHeight = targetH > 0 ? targetH : 720;
+    } else {
+        // Manual zoom
+        outWidth = (int)(contentWidth * g_uiState.zoomLevel);
+        outHeight = (int)(contentHeight * g_uiState.zoomLevel);
     }
 
     // Ensure minimum size

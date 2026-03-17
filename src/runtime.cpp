@@ -250,6 +250,7 @@ static UINT g_persistentHeight = 540;
 static bool g_windowClassRegistered = false;
 static DWORD g_windowOwnerThread = 0;  // Thread that created the preview window
 static HWND g_orphanedWindow = nullptr;  // Window left behind from a previous session
+static bool g_inLiveResize = false;  // True while user is dragging window border
 
 struct Instance {
     XrInstance handle{(XrInstance)1};
@@ -380,6 +381,9 @@ static ControllerState g_rightController = {
 
 // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
 static std::unordered_map<XrSpace, int> g_controllerSpaces;
+
+// Map XrSpace handles to reference space type (VIEW=1, LOCAL=2, STAGE=3)
+static std::unordered_map<XrSpace, XrReferenceSpaceType> g_referenceSpaces;
 
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
@@ -700,6 +704,22 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 return 0;
             }
             break;
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED) {
+                int newW = LOWORD(lParam);
+                int newH = HIWORD(lParam);
+                if (newW > 0 && newH > 0) {
+                    ui::g_uiState.windowWidth = newW;
+                    ui::g_uiState.windowHeight = newH;
+                }
+            }
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            rt::g_inLiveResize = true;
+            return 0;
+        case WM_EXITSIZEMOVE:
+            rt::g_inLiveResize = false;
+            return 0;
         default:
             break;
     }
@@ -1306,29 +1326,31 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         rt::g_session.d3d11Context->Flush();
     }
 
-    // 2. Destroy the preview window.
+    // 2. Close the preview window.
     {
-        HWND windowToDestroy = rt::g_session.hwnd;
+        HWND windowToClose = rt::g_session.hwnd;
         {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
             rt::g_persistentWindow = nullptr;
             rt::g_persistentSwapchain.Reset();
         }
-        if (windowToDestroy && IsWindow(windowToDestroy)) {
+        if (windowToClose && IsWindow(windowToClose)) {
             // Neutralize WndProc first so it won't access session state
-            SetWindowLongPtrW(windowToDestroy, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
+            SetWindowLongPtrW(windowToClose, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
 
-            // Try DestroyWindow directly. Works if we're on the owning thread.
             if (GetCurrentThreadId() == rt::g_windowOwnerThread) {
-                DestroyWindow(windowToDestroy);
+                // Same thread: destroy directly
+                DestroyWindow(windowToClose);
                 Log("[SimXR] xrDestroySession: Window destroyed (same thread)");
             } else {
-                // Cross-thread: post WM_CLOSE and store as orphaned.
-                // The owning thread's message pump (or next ensurePreviewSized)
-                // will process the close.
-                PostMessageW(windowToDestroy, WM_CLOSE, 0, 0);
-                rt::g_orphanedWindow = windowToDestroy;
-                Log("[SimXR] xrDestroySession: Window orphaned (cross-thread, close posted)");
+                // Cross-thread: DestroyWindow can only be called from the creator thread.
+                // Hide immediately (ShowWindowAsync is safe cross-thread) so the user
+                // sees the window disappear right away. Store as orphaned for actual
+                // HWND destruction on the owning thread (next ensurePreviewSized or
+                // xrDestroyInstance).
+                ShowWindowAsync(windowToClose, SW_HIDE);
+                rt::g_orphanedWindow = windowToClose;
+                Log("[SimXR] xrDestroySession: Window hidden and orphaned (cross-thread)");
             }
         }
     }
@@ -1372,6 +1394,11 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_session.previewWidth = 1920;
     rt::g_session.previewHeight = 540;
     rt::g_session.isFocused = false;
+
+    // 10. Clear space tracking maps
+    rt::g_referenceSpaces.clear();
+    rt::g_controllerSpaces.clear();
+
     Log("[SimXR] xrDestroySession: SUCCESS");
     return XR_SUCCESS;
 }
@@ -2468,7 +2495,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
                 
                 // Just resize the existing window if needed
                 RECT rc = { 0, 0, (LONG)width, (LONG)height };
-                AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+                AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);  // TRUE = has menu
                 SetWindowPos(s.hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
                 
                 // Make sure it's visible
@@ -2480,7 +2507,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         // Create new window if we don't have one
         if (!s.hwnd) {
             RECT rc = { 0, 0, (LONG)width, (LONG)height };
-            AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+            AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);  // TRUE = will have menu
             s.hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)", WS_OVERLAPPEDWINDOW,
                                      100, 100, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
             if (!s.hwnd) {
@@ -2507,11 +2534,14 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
             }
         }
     } else {
-        // Resize existing window
-        RECT rc = { 0, 0, (LONG)width, (LONG)height };
-        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(s.hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
-        Logf("[SimXR] Resized preview window: hwnd=%p size=%ux%u", s.hwnd, width, height);
+        // Resize existing window — only if NOT in fitToWindow mode.
+        // In fitToWindow mode the swapchain adapts to the window, not vice versa.
+        if (!ui::g_uiState.fitToWindow) {
+            RECT rc = { 0, 0, (LONG)width, (LONG)height };
+            AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);  // TRUE = has menu
+            SetWindowPos(s.hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
+            Logf("[SimXR] Resized preview window: hwnd=%p size=%ux%u", s.hwnd, width, height);
+        }
     }
     if (!s.usesD3D12) {
         ComPtr<IDXGIDevice> dxgiDev; s.d3d11Device.As(&dxgiDev);
@@ -3492,12 +3522,20 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             int targetWidth = (int)width;
             int targetHeight = (int)height;
             ui::CalculateWindowSize((int)width, (int)height, targetWidth, targetHeight);
-
+            // If fitToWindow and window already exists, use its actual client area
+            if (ui::g_uiState.fitToWindow && s.hwnd) {
+                RECT cr; GetClientRect(s.hwnd, &cr);
+                int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+                if (cw > 0 && ch > 0) { targetWidth = cw; targetHeight = ch; }
+            }
             if (glFrameCount % 60 == 1) {
                 Logf("[SimXR] GL PREVIEW: targetSize=%dx%d, calling ensurePreviewSized", targetWidth, targetHeight);
             }
 
-            ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
+            // During live resize, skip swapchain recreation
+            if (!rt::g_inLiveResize) {
+                ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
+            }
 
             if (!s.previewSwapchain) {
                 Log("[SimXR] GL PREVIEW: ERROR - previewSwapchain is NULL after ensurePreviewSized!");
@@ -3700,7 +3738,19 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         int targetWidth = (int)width;
         int targetHeight = (int)height;
         ui::CalculateWindowSize((int)width, (int)height, targetWidth, targetHeight);
-        ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
+        // If fitToWindow and window already exists, use its actual client area
+        // so the swapchain follows the window (not the other way around)
+        if (ui::g_uiState.fitToWindow && s.hwnd) {
+            RECT cr; GetClientRect(s.hwnd, &cr);
+            int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+            if (cw > 0 && ch > 0) { targetWidth = cw; targetHeight = ch; }
+        }
+        // During live resize, just present to the existing swapchain — skip recreation
+        if (rt::g_inLiveResize && (s.previewSwapchain || s.previewSwapchain12)) {
+            // Still need to present, but don't recreate
+        } else {
+            ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
+        }
         const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
         const bool showLeft = (viewMode != ui::ViewMode::RightEyeOnly);
         const bool showRight = (viewMode != ui::ViewMode::LeftEyeOnly);
@@ -4383,8 +4433,23 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
     if (cap < 2 || !views) return XR_SUCCESS;
     const float ipd = 0.064f;
     
-    // Use dynamic head pose from mouse look
-    XrQuaternionf orientation = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
+    // Determine the reference space type for the requested base space
+    // If base space is VIEW, views should be relative to the head (just IPD offsets).
+    // If base space is LOCAL/STAGE, views should be in world space (include head rotation).
+    bool baseIsView = false;
+    if (li && li->space) {
+        auto it = rt::g_referenceSpaces.find(li->space);
+        if (it != rt::g_referenceSpaces.end() && it->second == XR_REFERENCE_SPACE_TYPE_VIEW) {
+            baseIsView = true;
+        }
+    }
+
+    // Head orientation in world space
+    XrQuaternionf headOri = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
+
+    // Eye orientation: if base is VIEW, eyes look forward (identity); 
+    // if base is LOCAL/STAGE, eyes include the full head rotation.
+    XrQuaternionf eyeOrientation = baseIsView ? XrQuaternionf{0, 0, 0, 1} : headOri;
     
     // Helper function to rotate a vector by a quaternion
     auto rotateVector = [](XrQuaternionf q, XrVector3f v) -> XrVector3f {
@@ -4413,19 +4478,24 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
 
     for (uint32_t i = 0; i < 2; ++i) {
         views[i].type = XR_TYPE_VIEW;
-        views[i].pose.orientation = orientation;
+        views[i].pose.orientation = eyeOrientation;
         
-        // Apply IPD offset in full head orientation space (yaw+pitch)
-        // This fixes stereo geometry and eliminates warping when pitching
+        // Apply IPD offset in the eye orientation space
         float eyeOffset = (i == 0 ? -ipd * 0.5f : ipd * 0.5f);
         XrVector3f localEyeOffset{ eyeOffset, 0.0f, 0.0f };
-        XrVector3f rotatedOffset = rotateVector(orientation, localEyeOffset);
+        XrVector3f rotatedOffset = rotateVector(eyeOrientation, localEyeOffset);
         
-        views[i].pose.position = {
-            rt::g_headPos.x + rotatedOffset.x,
-            rt::g_headPos.y + rotatedOffset.y,
-            rt::g_headPos.z + rotatedOffset.z
-        };
+        if (baseIsView) {
+            // Relative to head: just IPD offset, no head position
+            views[i].pose.position = rotatedOffset;
+        } else {
+            // In world space: head position + rotated IPD offset
+            views[i].pose.position = {
+                rt::g_headPos.x + rotatedOffset.x,
+                rt::g_headPos.y + rotatedOffset.y,
+                rt::g_headPos.z + rotatedOffset.z
+            };
+        }
         
         // Configurable FOV from UI settings
         // Convert degrees to tangent: tan(fovDegrees/2 * PI/180)
@@ -4450,12 +4520,15 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
     if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
     static uintptr_t nextSpace = 100;
     *space = (XrSpace)(nextSpace++);
+    rt::g_referenceSpaces[*space] = info->referenceSpaceType;
     Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrDestroySpace_runtime(XrSpace space) {
     Logf("[SimXR] xrDestroySpace: space=%p", space);
+    rt::g_referenceSpaces.erase(space);
+    rt::g_controllerSpaces.erase(space);
     return XR_SUCCESS;
 }
 
@@ -4500,10 +4573,59 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
             location->pose.position = {0, 0, 0};
         }
     } else {
-        // Default for non-controller spaces (identity pose)
-        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-        location->pose.orientation = {0, 0, 0, 1};
-        location->pose.position = {0, 0, 0};
+        // Reference space or unknown space - look up types
+        auto itSpace = rt::g_referenceSpaces.find(space);
+        auto itBase  = rt::g_referenceSpaces.find(baseSpace);
+        XrReferenceSpaceType spaceType = itSpace != rt::g_referenceSpaces.end() ? itSpace->second : XR_REFERENCE_SPACE_TYPE_LOCAL;
+        XrReferenceSpaceType baseType  = itBase  != rt::g_referenceSpaces.end() ? itBase->second  : XR_REFERENCE_SPACE_TYPE_LOCAL;
+
+        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | 
+                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+
+        // Compute head pose in world space
+        XrQuaternionf headOri = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
+        XrVector3f headPos = rt::g_headPos;
+
+        bool spaceIsView = (spaceType == XR_REFERENCE_SPACE_TYPE_VIEW);
+        bool baseIsView  = (baseType  == XR_REFERENCE_SPACE_TYPE_VIEW);
+
+        if (spaceIsView && !baseIsView) {
+            // VIEW relative to LOCAL/STAGE = head pose in world
+            location->pose.orientation = headOri;
+            location->pose.position = headPos;
+        } else if (!spaceIsView && baseIsView) {
+            // LOCAL/STAGE relative to VIEW = inverse head pose
+            // Inverse quaternion: conjugate (negate xyz)
+            XrQuaternionf invOri = { -headOri.x, -headOri.y, -headOri.z, headOri.w };
+            // Inverse position: -invOri * pos
+            // Rotate -headPos by inverse orientation
+            float qx = invOri.x, qy = invOri.y, qz = invOri.z, qw = invOri.w;
+            float vx = -headPos.x, vy = -headPos.y, vz = -headPos.z;
+            // q * v * q^-1 (but q is already invOri, so q^-1 = headOri)
+            float tx = 2.0f * (qy * vz - qz * vy);
+            float ty = 2.0f * (qz * vx - qx * vz);
+            float tz = 2.0f * (qx * vy - qy * vx);
+            location->pose.position = {
+                vx + qw * tx + (qy * tz - qz * ty),
+                vy + qw * ty + (qz * tx - qx * tz),
+                vz + qw * tz + (qx * ty - qy * tx)
+            };
+            location->pose.orientation = invOri;
+        } else {
+            // Same type (e.g., LOCAL vs STAGE) or both VIEW: identity
+            location->pose.orientation = {0, 0, 0, 1};
+            location->pose.position = {0, 0, 0};
+        }
+
+        // Handle velocity if chained (XrSpaceVelocity)
+        XrSpaceVelocity* velocity = (XrSpaceVelocity*)location->next;
+        if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) {
+            velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+            velocity->linearVelocity = {0, 0, 0};
+            velocity->angularVelocity = {0, 0, 0};
+        }
     }
     return XR_SUCCESS;
 }

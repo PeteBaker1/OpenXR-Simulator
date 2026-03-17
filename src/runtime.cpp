@@ -248,6 +248,8 @@ static ComPtr<IDXGISwapChain1> g_persistentSwapchain;
 static UINT g_persistentWidth = 1920;
 static UINT g_persistentHeight = 540;
 static bool g_windowClassRegistered = false;
+static DWORD g_windowOwnerThread = 0;  // Thread that created the preview window
+static HWND g_orphanedWindow = nullptr;  // Window left behind from a previous session
 
 struct Instance {
     XrInstance handle{(XrInstance)1};
@@ -331,7 +333,7 @@ static Session g_session{};
 static std::unordered_map<XrSwapchain, Swapchain> g_swapchains;
 
 // Head tracking state for mouse look and WASD movement
-static XrVector3f g_headPos = {0.0f, 1.7f, 0.0f};  // Start at standing eye height
+static XrVector3f g_headPos = {0.0f, 0.0f, 0.0f};  // Start at origin (UE adds its own camera height)
 static float g_headYaw = 0.0f;    // Rotation around Y axis (left/right)
 static float g_headPitch = 0.0f;  // Rotation around X axis (up/down)
 static bool g_mouseCapture = false;
@@ -677,7 +679,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (ui::HandleMenuCommand(hWnd, wParam,
                 []() { /* Resize handled by presentProjection based on zoom */ },
                 []() { mcp::g_screenshotRequested = true; },
-                []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; }
+                []() { rt::g_headPos = {0, 0, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; }
             )) {
                 return 0;
             }
@@ -687,7 +689,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (ui::HandleKeyboardShortcut(hWnd, wParam,
                     []() { /* Resize handled by presentProjection based on zoom */ },
                     []() { mcp::g_screenshotRequested = true; },
-                    []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; }
+                    []() { rt::g_headPos = {0, 0, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; }
                 )) {
                     return 0;
                 }
@@ -1025,6 +1027,15 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
             rt::g_session.hwnd = nullptr;
         }
 
+        // Also clean up any orphaned window from a prior session
+        if (rt::g_orphanedWindow && IsWindow(rt::g_orphanedWindow) && rt::g_orphanedWindow != windowToDestroy) {
+            SetWindowLongPtrW(rt::g_orphanedWindow, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
+            if (GetCurrentThreadId() == rt::g_windowOwnerThread) {
+                DestroyWindow(rt::g_orphanedWindow);
+            }
+            rt::g_orphanedWindow = nullptr;
+        }
+
         if (windowToDestroy && IsWindow(windowToDestroy)) {
             Log("[SimXR] xrDestroyInstance: Destroying preview window");
             // Replace WndProc with DefWindowProc so even if DestroyWindow
@@ -1051,6 +1062,7 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
             }
             Log("[SimXR] xrDestroyInstance: Window cleanup done");
         }
+        rt::g_windowOwnerThread = 0;
 
         // Unregister window class so it doesn't have dangling WndProc
         if (rt::g_windowClassRegistered) {
@@ -1294,24 +1306,30 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         rt::g_session.d3d11Context->Flush();
     }
 
-    // 2. Neutralize and abandon the window.
-    //    The persistent window concept caused cross-thread deadlocks and stale
-    //    messages. Instead: swap WndProc to DefWindowProcW (safe if DLL unloads),
-    //    clear all references, and post WM_CLOSE so it eventually self-destructs
-    //    when someone pumps messages on its thread.
+    // 2. Destroy the preview window.
     {
-        HWND windowToAbandon = rt::g_session.hwnd;
+        HWND windowToDestroy = rt::g_session.hwnd;
         {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
             rt::g_persistentWindow = nullptr;
             rt::g_persistentSwapchain.Reset();
         }
-        if (windowToAbandon && IsWindow(windowToAbandon)) {
-            // Make the window safe: DefWindowProcW handles WM_CLOSE by calling
-            // DestroyWindow, and won't call into our (possibly unloaded) code.
-            SetWindowLongPtrW(windowToAbandon, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
-            PostMessageW(windowToAbandon, WM_CLOSE, 0, 0);
-            Log("[SimXR] xrDestroySession: Window neutralized and close posted");
+        if (windowToDestroy && IsWindow(windowToDestroy)) {
+            // Neutralize WndProc first so it won't access session state
+            SetWindowLongPtrW(windowToDestroy, GWLP_WNDPROC, (LONG_PTR)DefWindowProcW);
+
+            // Try DestroyWindow directly. Works if we're on the owning thread.
+            if (GetCurrentThreadId() == rt::g_windowOwnerThread) {
+                DestroyWindow(windowToDestroy);
+                Log("[SimXR] xrDestroySession: Window destroyed (same thread)");
+            } else {
+                // Cross-thread: post WM_CLOSE and store as orphaned.
+                // The owning thread's message pump (or next ensurePreviewSized)
+                // will process the close.
+                PostMessageW(windowToDestroy, WM_CLOSE, 0, 0);
+                rt::g_orphanedWindow = windowToDestroy;
+                Log("[SimXR] xrDestroySession: Window orphaned (cross-thread, close posted)");
+            }
         }
     }
 
@@ -2409,6 +2427,13 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     }
 
     if (!s.hwnd) {
+        // Destroy any orphaned window from a previous session (we're on the owning thread)
+        if (rt::g_orphanedWindow && IsWindow(rt::g_orphanedWindow)) {
+            DestroyWindow(rt::g_orphanedWindow);
+            Log("[SimXR] ensurePreviewSized: Destroyed orphaned window from previous session");
+        }
+        rt::g_orphanedWindow = nullptr;
+
         // Check if we have a persistent window from a previous session
         {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
@@ -2467,6 +2492,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
             SetForegroundWindow(s.hwnd);
             SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
             Logf("[SimXR] Created new preview window: hwnd=%p size=%ux%u", s.hwnd, width, height);
+            rt::g_windowOwnerThread = GetCurrentThreadId();
             
             // Apply dark theme and menu
             ui::ApplyDarkTheme(s.hwnd);
